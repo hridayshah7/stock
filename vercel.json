@@ -1,9 +1,10 @@
 {
   "version": 2,
+  
   "builds": [
     {
-      "src": "api/main.py",
-      "use": "@vercel/python"
+      "src": "Dockerfile",
+      "use": "@vercel/docker"
     }
   ],
   "routes": [
@@ -15,4 +16,5 @@
   "env": {
     "PYTHONPATH": "."
   }
+  
 }
