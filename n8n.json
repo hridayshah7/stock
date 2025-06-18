@@ -1,0 +1,303 @@
+{
+  "nodes": [
+    {
+      "parameters": {
+        "language": "python",
+        "pythonCode": "import logging\nimport asyncio\nimport yfinance as yf\nimport pandas as pd\nimport numpy as np\nfrom datetime import datetime, timedelta\nfrom apscheduler.schedulers.asyncio import AsyncIOScheduler\nfrom telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler\nfrom telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup\n\n# Setup logging\nlogging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')\nlogger = logging.getLogger(__name__)\n\n# Constants\nBOT_TOKEN = \"8166189610:AAEGeti-NF2BNYd68qY0CEysDKUz6xNNIpg\"\nAUTHORIZED_USER_ID = 945542175\nSYMBOLS = [\n    \"ADANIENT.NS\", \"ADANIPORTS.NS\", \"AMBUJACEM.NS\", \"APOLLOHOSP.NS\", \"ASIANPAINT.NS\",\n    \"AXISBANK.NS\", \"BAJAJ_AUTO.NS\", \"BAJAJFINSV.NS\", \"BAJFINANCE.NS\", \"BHARTIARTL.NS\",\n    \"BPCL.NS\", \"BRITANNIA.NS\", \"CIPLA.NS\", \"COALINDIA.NS\", \"DIVISLAB.NS\",\n    \"DRREDDY.NS\", \"EICHERMOT.NS\", \"GRASIM.NS\", \"HCLTECH.NS\", \"HDFCBANK.NS\",\n    \"HDFCLIFE.NS\", \"HEROMOTOCO.NS\", \"HINDALCO.NS\", \"HINDUNILVR.NS\", \"ICICIBANK.NS\",\n    \"IDFCFIRSTB.NS\", \"INDUSINDBK.NS\", \"INFY.NS\", \"ITC.NS\", \"JSWSTEEL.NS\",\n    \"KOTAKBANK.NS\", \"LT.NS\", \"LTIM.NS\", \"LTTS.NS\", \"M&M.NS\",\n    \"MARUTI.NS\", \"NESTLEIND.NS\", \"NTPC.NS\", \"ONGC.NS\", \"PIDILITIND.NS\",\n    \"POWERGRID.NS\", \"RELIANCE.NS\", \"SBILIFE.NS\", \"SBIN.NS\", \"SHREECEM.NS\",\n    \"SUNPHARMA.NS\", \"TATACONSUM.NS\", \"TATAMOTORS.NS\", \"TATASTEEL.NS\", \"TCS.NS\",\n    \"TECHM.NS\", \"TITAN.NS\", \"ULTRACEMCO.NS\", \"UPL.NS\", \"WIPRO.NS\",\n    \"ADANIGREEN.NS\", \"ADANITRANS.NS\", \"ATGL.NS\", \"BANKBARODA.NS\", \"BEL.NS\",\n    \"CHOLAFIN.NS\", \"DABUR.NS\", \"DLF.NS\", \"GAIL.NS\", \"GODREJCP.NS\",\n    \"HAVELLS.NS\", \"ICICIPRULI.NS\", \"INDIGO.NS\", \"JINDALSTEL.NS\", \"NMDC.NS\",\n    \"PAYTM.NS\", \"PETRONET.NS\", \"PNB.NS\", \"RECLTD.NS\", \"SAIL.NS\",\n    \"SIEMENS.NS\", \"SRF.NS\", \"TATAPOWER.NS\", \"TRENT.NS\", \"TVSMOTOR.NS\",\n    \"VEDL.NS\", \"VOLTAS.NS\", \"YESBANK.NS\", \"ZOMATO.NS\", \"IRCTC.NS\",\n    \"MUTHOOTFIN.NS\", \"ABB.NS\", \"CONCOR.NS\", \"CROMPTON.NS\", \"NAUKRI.NS\",\n    \"PAGEIND.NS\", \"BANDHANBNK.NS\", \"BHEL.NS\", \"BIOCON.NS\", \"COLPAL.NS\",\"DIXON.NS\",\"KAYNES.NS\"\n]\n\n# Advanced weight scoring system\nweights = {\n    # Momentum indicators\n    \"price_change\": 3,          # Recent price change\n    \"volume_spike\": 2.5,        # Volume increase\n    \"rsi_signal\": 2,            # RSI signal (oversold/overbought)\n    \"macd_signal\": 2.5,         # MACD crossing\n    \n    # Trend indicators\n    \"above_ma50\": 2,            # Price above 50-day MA\n    \"ma20_above_ma50\": 2,       # 20-day MA above 50-day MA (golden cross)\n    \"above_avg_close\": 1.5,     # Current close above average\n    \n    # Price action\n    \"green_candle\": 1.5,        # Closing price above opening price\n    \"near_high\": 2,             # Close near day's high\n    \"higher_high\": 2,           # Higher high than previous day\n    \"higher_low\": 1.5,          # Higher low than previous day\n    \n    # Support/Resistance\n    \"bounced_support\": 3,       # Bounced off support\n    \"broke_resistance\": 3,      # Broke through resistance\n    \n    # Volatility\n    \"low_volatility\": 1.5,      # Low volatility (ATR/price ratio)\n}\n\n# Technical analysis functions\ndef calculate_rsi(data, window=14):\n    # Calculate RSI (Relative Strength Index)\n    delta = data.diff()\n    gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()\n    loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()\n    \n    rs = gain / loss\n    rsi = 100 - (100 / (1 + rs))\n    return rsi\n\ndef calculate_macd(data, fast=12, slow=26, signal=9):\n    # Calculate MACD (Moving Average Convergence Divergence)\n    exp1 = data.ewm(span=fast, adjust=False).mean()\n    exp2 = data.ewm(span=slow, adjust=False).mean()\n    macd = exp1 - exp2\n    signal_line = macd.ewm(span=signal, adjust=False).mean()\n    histogram = macd - signal_line\n    return macd, signal_line, histogram\n\ndef calculate_atr(data, window=14):\n    # Calculate ATR (Average True Range)\n    high = data['High']\n    low = data['Low']\n    close = data['Close'].shift(1)\n    \n    tr1 = high - low\n    tr2 = abs(high - close)\n    tr3 = abs(low - close)\n    \n    true_range = pd.DataFrame({'tr1': tr1, 'tr2': tr2, 'tr3': tr3}).max(axis=1)\n    atr = true_range.rolling(window=window).mean()\n    return atr\n\ndef find_support_resistance(data, window=10):\n    # Simple support and resistance detection based on recent lows and highs\n    support = data['Low'].rolling(window=window).min()\n    resistance = data['High'].rolling(window=window).max()\n    return support, resistance\n\ndef calculate_detailed_score(df):\n    \"\"\"Calculate a detailed score with buy/sell signals and target prices\"\"\"\n    try:\n        if df is None or df.empty or len(df) < 30:  # Need more data for reliable signals\n            return {\n                'score': -1,\n                'action': 'INSUFFICIENT_DATA',\n                'signals': {},\n                'entry': None,\n                'stop_loss': None,\n                'target': None,\n                'risk_reward': None\n            }\n\n        # Fix for multi-level columns if present\n        if isinstance(df.columns, pd.MultiIndex):\n            df = df.copy()\n            df.columns = df.columns.get_level_values(0)\n        \n        # Make sure we have the required columns\n        required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']\n        if not all(col in df.columns for col in required_cols):\n            logger.error(f\"Missing required columns. Available: {df.columns}\")\n            return {\n                'score': -1,\n                'action': 'MISSING_DATA',\n                'signals': {},\n                'entry': None,\n                'stop_loss': None,\n                'target': None,\n                'risk_reward': None\n            }\n        \n        # Calculate technical indicators\n        df['MA20'] = df['Close'].rolling(window=20).mean()\n        df['MA50'] = df['Close'].rolling(window=50).mean()\n        df['RSI'] = calculate_rsi(df['Close'])\n        df['MACD'], df['MACD_Signal'], df['MACD_Hist'] = calculate_macd(df['Close'])\n        df['ATR'] = calculate_atr(df)\n        df['Support'], df['Resistance'] = find_support_resistance(df)\n        \n        # Get the latest data points\n        latest = df.iloc[-1]\n        prev = df.iloc[-2]\n        \n        # Initialize signals dict and score\n        signals = {}\n        score = 0\n        \n        # 1. Recent Price Change\n        price_change = ((latest['Close'] - prev['Close']) / prev['Close']) * 100\n        signals['price_change'] = price_change\n        if price_change > 1.5:\n            score += weights[\"price_change\"]\n            signals['price_change_signal'] = 'BULLISH'\n        elif price_change < -1.5:\n            score -= weights[\"price_change\"]\n            signals['price_change_signal'] = 'BEARISH'\n        else:\n            signals['price_change_signal'] = 'NEUTRAL'\n        \n        # 2. Volume Analysis\n        avg_vol = df['Volume'][-5:-1].mean()\n        vol_change = (latest['Volume'] - avg_vol) / avg_vol * 100\n        signals['volume_change'] = vol_change\n        if vol_change > 50 and price_change > 0:\n            score += weights[\"volume_spike\"]\n            signals['volume_signal'] = 'BULLISH'\n        elif vol_change > 50 and price_change < 0:\n            score -= weights[\"volume_spike\"]\n            signals['volume_signal'] = 'BEARISH'\n        else:\n            signals['volume_signal'] = 'NEUTRAL'\n        \n        # 3. RSI Analysis\n        current_rsi = latest['RSI']\n        signals['rsi'] = current_rsi\n        if 30 < current_rsi < 50 and current_rsi > prev['RSI']:\n            score += weights[\"rsi_signal\"]  # Bullish - coming out of oversold\n            signals['rsi_signal'] = 'BULLISH'\n        elif 70 > current_rsi > 50 and current_rsi < prev['RSI']:\n            score -= weights[\"rsi_signal\"]  # Bearish - coming down from overbought\n            signals['rsi_signal'] = 'BEARISH'\n        elif current_rsi < 30:\n            signals['rsi_signal'] = 'OVERSOLD'\n        elif current_rsi > 70:\n            signals['rsi_signal'] = 'OVERBOUGHT'\n        else:\n            signals['rsi_signal'] = 'NEUTRAL'\n        \n        # 4. MACD Analysis\n        macd_current = latest['MACD']\n        macd_signal = latest['MACD_Signal']\n        macd_prev = prev['MACD']\n        macd_signal_prev = prev['MACD_Signal']\n        \n        signals['macd'] = macd_current\n        signals['macd_signal'] = macd_signal\n        \n        if macd_current > macd_signal and macd_prev < macd_signal_prev:\n            score += weights[\"macd_signal\"]  # Bullish crossover\n            signals['macd_signal'] = 'BULLISH_CROSS'\n        elif macd_current < macd_signal and macd_prev > macd_signal_prev:\n            score -= weights[\"macd_signal\"]  # Bearish crossover\n            signals['macd_signal'] = 'BEARISH_CROSS'\n        elif macd_current > macd_signal:\n            signals['macd_signal'] = 'BULLISH'\n        elif macd_current < macd_signal:\n            signals['macd_signal'] = 'BEARISH'\n        else:\n            signals['macd_signal'] = 'NEUTRAL'\n        \n        # 5. Moving Average Analysis\n        signals['above_ma50'] = latest['Close'] > latest['MA50']\n        signals['ma20_above_ma50'] = latest['MA20'] > latest['MA50']\n        \n        if signals['above_ma50']:\n            score += weights[\"above_ma50\"]\n        \n        if signals['ma20_above_ma50']:\n            score += weights[\"ma20_above_ma50\"]\n        \n        # 6. Price Action Analysis\n        signals['green_candle'] = latest['Close'] > latest['Open']\n        \n        high_low_range = latest['High'] - latest['Low']\n        if high_low_range > 0:\n            high_close_ratio = (latest['Close'] - latest['Low']) / high_low_range\n            signals['high_close_ratio'] = high_close_ratio\n            if high_close_ratio > 0.8:\n                score += weights[\"near_high\"]\n                signals['near_high'] = True\n            else:\n                signals['near_high'] = False\n        \n        signals['higher_high'] = latest['High'] > prev['High']\n        signals['higher_low'] = latest['Low'] > prev['Low']\n        \n        if signals['green_candle']:\n            score += weights[\"green_candle\"]\n        \n        if signals['higher_high']:\n            score += weights[\"higher_high\"]\n        \n        if signals['higher_low']:\n            score += weights[\"higher_low\"]\n        \n        # 7. Support/Resistance Analysis\n        support_level = latest['Support']\n        resistance_level = latest['Resistance']\n        \n        signals['support'] = support_level\n        signals['resistance'] = resistance_level\n        \n        # Check if price bounced off support\n        if prev['Low'] <= prev['Support'] * 1.01 and latest['Close'] > latest['Open']:\n            score += weights[\"bounced_support\"]\n            signals['bounced_support'] = True\n        else:\n            signals['bounced_support'] = False\n        \n        # Check if price broke through resistance\n        if prev['High'] >= prev['Resistance'] * 0.99 and latest['Close'] > latest['Resistance']:\n            score += weights[\"broke_resistance\"]\n            signals['broke_resistance'] = True\n        else:\n            signals['broke_resistance'] = False\n        \n        # 8. Volatility Analysis\n        atr_to_price = latest['ATR'] / latest['Close'] * 100\n        signals['atr_percent'] = atr_to_price\n        \n        if atr_to_price < 1.5:  # Low volatility\n            score += weights[\"low_volatility\"]\n            signals['volatility'] = 'LOW'\n        elif atr_to_price > 3:  # High volatility\n            signals['volatility'] = 'HIGH'\n        else:\n            signals['volatility'] = 'MEDIUM'\n        \n        # Normalize the score to a 0-100 scale\n        max_possible_score = sum(weights.values())\n        normalized_score = min(max(0, (score + max_possible_score/2) / max_possible_score * 100), 100)\n        signals['raw_score'] = score\n        \n        # Determine action based on score\n        if normalized_score >= 75:\n            action = 'STRONG_BUY'\n        elif normalized_score >= 60:\n            action = 'BUY'\n        elif normalized_score >= 45:\n            action = 'HOLD'\n        elif normalized_score >= 30:\n            action = 'SELL'\n        else:\n            action = 'STRONG_SELL'\n        \n        # Calculate entry, stop loss and target prices\n        current_price = latest['Close']\n        entry_price = current_price\n        \n        # For buy signals\n        if action in ['BUY', 'STRONG_BUY']:\n            # Stop loss at recent support or 2 ATR below entry\n            stop_loss = max(support_level, current_price - 2 * latest['ATR'])\n            # Target at recent resistance or 3:1 risk-reward ratio\n            risk = entry_price - stop_loss\n            target = entry_price + (risk * 3)\n            risk_reward = 3.0\n        \n        # For sell signals\n        elif action in ['SELL', 'STRONG_SELL']:\n            # Stop loss at recent resistance or 2 ATR above entry\n            stop_loss = min(resistance_level, current_price + 2 * latest['ATR'])\n            # Target at recent support or 3:1 risk-reward ratio\n            risk = stop_loss - entry_price\n            target = entry_price - (risk * 3)\n            risk_reward = 3.0\n        \n        # For hold signals\n        else:\n            stop_loss = None\n            target = None\n            risk_reward = None\n        \n        # If we're very close to a significant level, adjust the entry price\n        if action in ['BUY', 'STRONG_BUY'] and signals.get('broke_resistance'):\n            # Wait for pullback to broken resistance\n            entry_price = resistance_level\n        \n        # Format prices to 2 decimal places for readability\n        if entry_price is not None:\n            entry_price = round(entry_price, 2)\n        if stop_loss is not None:\n            stop_loss = round(stop_loss, 2)\n        if target is not None:\n            target = round(target, 2)\n        \n        return {\n            'score': round(normalized_score, 1),\n            'action': action,\n            'signals': signals,\n            'entry': entry_price,\n            'stop_loss': stop_loss,\n            'target': target,\n            'risk_reward': risk_reward,\n            'current_price': round(current_price, 2)\n        }\n    \n    except Exception as e:\n        logger.error(f\"Error in calculate_detailed_score: {e}\")\n        import traceback\n        logger.error(traceback.format_exc())\n        return {\n            'score': -1,\n            'action': 'ERROR',\n            'signals': {'error': str(e)},\n            'entry': None,\n            'stop_loss': None,\n            'target': None,\n            'risk_reward': None\n        }\n\n\ndef get_analysis(symbol: str) -> dict:\n    \"\"\"Fetch data and analyze a stock symbol\"\"\"\n    try:\n        logger.info(f\"Fetching data for {symbol}...\")\n        # Get 100 days of daily data for better analysis\n        df = yf.download(symbol, period='100d', interval='1d', auto_adjust=True)\n        \n        # Check if data was received\n        if df is None or df.empty:\n            logger.error(f\"No data received for {symbol}\")\n            return {\n                'symbol': symbol,\n                'score': -1,\n                'action': 'NO_DATA',\n                'message': f\"No data available for {symbol}\"\n            }\n            \n        logger.info(f\"[{symbol}] Data received: {len(df)} days\")\n        \n        # Calculate detailed score and signals\n        result = calculate_detailed_score(df)\n        result['symbol'] = symbol\n        \n        # Add technical summary\n        technical_summary = []\n        \n        signals = result.get('signals', {})\n        if signals.get('rsi_signal') == 'BULLISH':\n            technical_summary.append(\"RSI showing bullish momentum\")\n        elif signals.get('rsi_signal') == 'OVERSOLD':\n            technical_summary.append(\"RSI indicates oversold conditions\")\n        \n        if signals.get('macd_signal') == 'BULLISH_CROSS':\n            technical_summary.append(\"Recent MACD bullish crossover\")\n        \n        if signals.get('bounced_support'):\n            technical_summary.append(\"Price bounced off support level\")\n        \n        if signals.get('broke_resistance'):\n            technical_summary.append(\"Price broke through resistance\")\n        \n        if signals.get('higher_high') and signals.get('higher_low'):\n            technical_summary.append(\"Making higher highs and higher lows\")\n        \n        result['technical_summary'] = technical_summary\n        \n        return result\n        \n    except Exception as e:\n        logger.error(f\"Error analyzing {symbol}: {e}\")\n        return {\n            'symbol': symbol,\n            'score': -1,\n            'action': 'ERROR',\n            'message': f\"Error analyzing {symbol}: {str(e)}\"\n        }\n\n# Format analysis results into a readable message\ndef format_analysis_message(analysis):\n    if analysis['score'] == -1:\n        return f\"❌ {analysis['symbol']}: {analysis.get('message', 'Analysis failed')}\"\n    \n    # Get emoji for the action\n    action_emojis = {\n        'STRONG_BUY': '🔥 STRONG BUY',\n        'BUY': '🟢 BUY',\n        'HOLD': '⚪ HOLD',\n        'SELL': '🔴 SELL',\n        'STRONG_SELL': '⛔ STRONG SELL'\n    }\n    \n    action_text = action_emojis.get(analysis['action'], analysis['action'])\n    \n    # Build the message\n    message = f\"*{analysis['symbol']}* - Score: *{analysis['score']}*/100\\n\"\n    message += f\"Recommendation: *{action_text}*\\n\\n\"\n    \n    # Current price\n    message += f\"Current price: ₹{analysis.get('current_price', 'N/A')}\\n\"\n    \n    # Add entry/exit strategy if available\n    if analysis['action'] in ['BUY', 'STRONG_BUY', 'SELL', 'STRONG_SELL']:\n        message += \"📊 *Trade Setup:*\\n\"\n        message += f\"Entry: ₹{analysis.get('entry', 'N/A')}\\n\"\n        message += f\"Stop Loss: ₹{analysis.get('stop_loss', 'N/A')}\\n\"\n        message += f\"Target: ₹{analysis.get('target', 'N/A')}\\n\"\n        if analysis.get('risk_reward'):\n            message += f\"Risk/Reward: {analysis.get('risk_reward', 'N/A')}:1\\n\"\n        if analysis.get('time_frame'):\n            message += f\"Time Frame: {analysis.get('time_frame', 'N/A')}\\n\"\n    \n    # Add technical indicators summary\n    if analysis.get('technical_summary'):\n        message += \"\\n📈 *Technical Summary:*\\n\"\n        for point in analysis['technical_summary']:\n            message += f\"• {point}\\n\"\n    \n    # Add key signals and calculated values\n    if analysis.get('signals'):\n        signals = analysis['signals']\n        message += \"\\n🔍 *Key Indicators:*\\n\"\n        \n        # Price data\n        message += \"• *Price Data:* \"\n        message += f\"O: ₹{signals.get('open', 'N/A'):.2f} \"\n        message += f\"H: ₹{signals.get('high', 'N/A'):.2f} \"\n        message += f\"L: ₹{signals.get('low', 'N/A'):.2f} \"\n        message += f\"C: ₹{signals.get('close', 'N/A'):.2f}\\n\"\n        \n        if 'price_change' in signals:\n            message += f\"• Price Change: {signals['price_change']:.2f}%\\n\"\n        \n        # Moving Averages\n        if 'ma20' in signals and 'ma50' in signals:\n            message += f\"• MA20: ₹{signals['ma20']:.2f} | MA50: ₹{signals['ma50']:.2f}\\n\"\n            message += f\"• Price above MA50: {'Yes' if signals.get('above_ma50') else 'No'}\\n\"\n            message += f\"• MA20 above MA50: {'Yes' if signals.get('ma20_above_ma50') else 'No'}\\n\"\n        \n        # Support/Resistance\n        if 'support' in signals and 'resistance' in signals:\n            message += f\"• Support: ₹{signals['support']:.2f} | Resistance: ₹{signals['resistance']:.2f}\\n\"\n            if signals.get('broke_resistance') == True:\n                message += f\"• Broke resistance: Yes\\n\"\n            if signals.get('bounced_support') == True:\n                message += f\"• Bounced off support: Yes\\n\"\n        \n        # RSI\n        if 'rsi' in signals:\n            rsi_value = signals['rsi']\n            if pd.notna(rsi_value):\n                message += f\"• RSI: {rsi_value:.1f}\"\n                if rsi_value < 30:\n                    message += \" (Oversold)\"\n                elif rsi_value > 70:\n                    message += \" (Overbought)\"\n                message += \"\\n\"\n        \n        # MACD\n        if 'macd' in signals and 'macd_signal_line' in signals:\n            message += f\"• MACD: {signals['macd']:.3f} | Signal: {signals['macd_signal_line']:.3f}\\n\"\n            if signals.get('macd_signal') == 'BULLISH_CROSS':\n                message += f\"• MACD Bullish Crossover: Yes\\n\"\n            elif signals.get('macd_signal') == 'BEARISH_CROSS':\n                message += f\"• MACD Bearish Crossover: Yes\\n\"\n        \n        # Volatility (ATR)\n        if 'atr' in signals:\n            message += f\"• ATR: {signals['atr']:.2f} ({signals.get('atr_percent', 0):.2f}% of price)\\n\"\n            message += f\"• Volatility: {signals.get('volatility', 'N/A')}\\n\"\n        \n        # Volume\n        if 'volume_change' in signals:\n            message += f\"• Volume Change: {signals['volume_change']:.2f}%\\n\"\n    \n    return message\n\n\n# Command: /analyze <symbol>\nasync def analyze_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):\n    if update.effective_user.id != AUTHORIZED_USER_ID:\n        await update.message.reply_text(\"You are not authorized to use this bot.\")\n        return\n    \n    if not context.args:\n        await update.message.reply_text(\"Please use: /analyze <symbol>\")\n        return\n\n    symbol = context.args[0].upper()\n    if \".NS\" not in symbol:\n        symbol += \".NS\"\n\n    await update.message.reply_text(f\"🔍 Analyzing {symbol}...\")\n    analysis = get_analysis(symbol)\n    \n    # Format and send the analysis\n    message = format_analysis_message(analysis)\n    await update.message.reply_text(message, parse_mode='Markdown')\n\n# Command: /scan - Scan all stocks for opportunities\nasync def scan_stocks(update: Update, context: ContextTypes.DEFAULT_TYPE):\n    if update.effective_user.id != AUTHORIZED_USER_ID:\n        await update.message.reply_text(\"You are not authorized to use this bot.\")\n        return\n\n    await update.message.reply_text(\"🔍 Scanning all stocks for opportunities...\\nThis may take a few minutes.\")\n    \n    # Create a status message to update\n    status_message = await update.message.reply_text(\"⏳ Scan progress: 0%\")\n    \n    buy_opportunities = []\n    sell_opportunities = []\n    errors = []\n    progress = 0\n    \n    for symbol in SYMBOLS:\n        try:\n            analysis = get_analysis(symbol)\n            \n            if analysis['score'] == -1:\n                errors.append(symbol)\n            elif analysis['action'] in ['BUY', 'STRONG_BUY']:\n                buy_opportunities.append(analysis)\n            elif analysis['action'] in ['SELL', 'STRONG_SELL']:\n                sell_opportunities.append(analysis)\n                \n            # Update progress every 5%\n            new_progress = int((progress / len(SYMBOLS)) * 100)\n            if new_progress % 5 == 0 and new_progress > int((progress - 1) / len(SYMBOLS) * 100):\n                await status_message.edit_text(f\"⏳ Scan progress: {new_progress}%\")\n                \n            progress += 1\n            \n        except Exception as e:\n            logger.error(f\"Error scanning {symbol}: {e}\")\n            errors.append(symbol)\n            progress += 1\n    \n    # Sort opportunities by score\n    buy_opportunities.sort(key=lambda x: x['score'], reverse=True)\n    sell_opportunities.sort(key=lambda x: x['score'])\n    \n    # Build the results message\n    if buy_opportunities or sell_opportunities:\n        await status_message.edit_text(\"✅ Scan complete! Preparing results...\")\n        \n        # Send buy opportunities\n        if buy_opportunities:\n            buy_message = \"🟢 *BUY OPPORTUNITIES:*\\n\\n\"\n            for i, opportunity in enumerate(buy_opportunities[:5], 1):\n                buy_message += f\"{i}. *{opportunity['symbol']}* - Score: {opportunity['score']}/100\\n\"\n                buy_message += f\"   Price: ₹{opportunity.get('current_price', 'N/A')} | Entry: ₹{opportunity.get('entry', 'N/A')}\\n\"\n                buy_message += f\"   Target: ₹{opportunity.get('target', 'N/A')} | Stop: ₹{opportunity.get('stop_loss', 'N/A')}\\n\"\n                buy_message += f\"   Time Frame: {opportunity.get('time_frame', 'N/A')} | R:R: {opportunity.get('risk_reward', 'N/A')}:1\\n\\n\"\n            \n            await update.message.reply_text(buy_message, parse_mode='Markdown')\n            \n            # Create buttons for detailed analysis\n            keyboard = []\n            row = []\n            for i, opportunity in enumerate(buy_opportunities[:5]):\n                symbol = opportunity['symbol'].replace('.NS', '')\n                row.append(InlineKeyboardButton(symbol, callback_data=f\"analyze_{opportunity['symbol']}\"))\n                if (i + 1) % 3 == 0 or i == len(buy_opportunities[:5]) - 1:\n                    keyboard.append(row)\n                    row = []\n            \n            reply_markup = InlineKeyboardMarkup(keyboard)\n            await update.message.reply_text(\"Select a stock for detailed analysis:\", reply_markup=reply_markup)\n        \n        # Send sell opportunities\n        if sell_opportunities:\n            sell_message = \"🔴 *SELL OPPORTUNITIES:*\\n\\n\"\n            for i, opportunity in enumerate(sell_opportunities[:5], 1):\n                sell_message += f\"{i}. *{opportunity['symbol']}* - Score: {opportunity['score']}/100\\n\"\n                sell_message += f\"   Price: ₹{opportunity.get('current_price', 'N/A')} | Entry: ₹{opportunity.get('entry', 'N/A')}\\n\"\n                sell_message += f\"   Target: ₹{opportunity.get('target', 'N/A')} | Stop: ₹{opportunity.get('stop_loss', 'N/A')}\\n\"\n                sell_message += f\"   Time Frame: {opportunity.get('time_frame', 'N/A')} | R:R: {opportunity.get('risk_reward', 'N/A')}:1\\n\\n\"\n            \n            await update.message.reply_text(sell_message, parse_mode='Markdown')\n    else:\n        await status_message.edit_text(\"✅ Scan complete! No strong buy or sell signals found.\")\n    \n    if errors:\n        error_message = f\"⚠️ Could not analyze {len(errors)} symbols: {', '.join(errors[:5])}\"\n        if len(errors) > 5:\n            error_message += f\" and {len(errors) - 5} more\"\n        await update.message.reply_text(error_message)\n\n# Handle callback queries from inline buttons\nasync def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):\n    query = update.callback_query\n    await query.answer()\n    \n    if query.data.startswith(\"analyze_\"):\n        symbol = query.data.replace(\"analyze_\", \"\")\n        await query.message.reply_text(f\"🔍 Analyzing {symbol}...\")\n        analysis = get_analysis(symbol)\n        message = format_analysis_message(analysis)\n        await query.message.reply_text(message, parse_mode='Markdown')\n\n# Command: /watchlist - Show your watchlist\nasync def show_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):\n    if update.effective_user.id != AUTHORIZED_USER_ID:\n        await update.message.reply_text(\"You are not authorized to use this bot.\")\n        return\n\n    # Here we use a simplified watchlist - in a real app you'd store this in a database\n    watchlist = [\n        \"RELIANCE.NS\", \"INFY.NS\", \"TCS.NS\", \"HDFCBANK.NS\", \"ITC.NS\", \n        \"TATAMOTORS.NS\", \"ADANIENT.NS\", \"WIPRO.NS\", \"SBIN.NS\", \"ICICIBANK.NS\"\n    ]\n    \n    await update.message.reply_text(\"🔍 Analyzing your watchlist...\")\n    \n    results = []\n    for symbol in watchlist:\n        try:\n            analysis = get_analysis(symbol)\n            results.append(analysis)\n        except Exception as e:\n            logger.error(f\"Error analyzing watchlist item {symbol}: {e}\")\n    \n    # Sort by action (buy first, then hold, then sell)\n    action_priority = {\n        'STRONG_BUY': 0,\n        'BUY': 1,\n        'HOLD': 2,\n        'SELL': 3,\n        'STRONG_SELL': 4\n    }\n    \n    results.sort(key=lambda x: action_priority.get(x.get('action', 'HOLD'), 2))\n    \n    if results:\n        watchlist_message = \"📋 *YOUR WATCHLIST:*\\n\\n\"\n        for result in results:\n            if result['score'] == -1:\n                watchlist_message += f\"❌ {result['symbol']}: Analysis failed\\n\"\n                continue\n                \n            action_emojis = {\n                'STRONG_BUY': '🔥',\n                'BUY': '🟢',\n                'HOLD': '⚪',\n                'SELL': '🔴',\n                'STRONG_SELL': '⛔'\n            }\n            emoji = action_emojis.get(result['action'], '⚪')\n            \n            watchlist_message += f\"{emoji} *{result['symbol']}* - Score: {result['score']}/100 - {result['action']}\\n\"\n            watchlist_message += f\"   Price: ₹{result.get('current_price', 'N/A')}\"\n            \n            if result['action'] in ['BUY', 'STRONG_BUY', 'SELL', 'STRONG_SELL']:\n                watchlist_message += f\" | Entry: ₹{result.get('entry', 'N/A')}\"\n                watchlist_message += f\" | Target: ₹{result.get('target', 'N/A')}\"\n                watchlist_message += f\" | SL: ₹{result.get('stop_loss', 'N/A')}\"\n                watchlist_message += f\"\\n   Time Frame: {result.get('time_frame', 'N/A')} | R:R: {result.get('risk_reward', 'N/A')}:1\"\n            \n            watchlist_message += \"\\n\\n\"\n        \n        await update.message.reply_text(watchlist_message, parse_mode='Markdown')\n        \n        # Create buttons for detailed analysis\n        keyboard = []\n        row = []\n        for i, result in enumerate(results):\n            if result['score'] != -1:  # Only add buttons for valid analyses\n                symbol = result['symbol'].replace('.NS', '')\n                row.append(InlineKeyboardButton(symbol, callback_data=f\"analyze_{result['symbol']}\"))\n                if (i + 1) % 3 == 0 or i == len(results) - 1:\n                    keyboard.append(row)\n                    row = []\n        \n        reply_markup = InlineKeyboardMarkup(keyboard)\n        await update.message.reply_text(\"Select a stock for detailed analysis:\", reply_markup=reply_markup)\n    else:\n        await update.message.reply_text(\"No valid watchlist items to display.\")\n\n# Command: /start\nasync def start(update: Update, context: ContextTypes.DEFAULT_TYPE):\n    if update.effective_user.id != AUTHORIZED_USER_ID:\n        await update.message.reply_text(\"You are not authorized to use this bot.\")\n        return\n    \n    welcome_message = (\n        \"👋 *Welcome to StockSniperBot Pro!*\\n\\n\"\n        \"This bot helps you identify trading opportunities in the Indian stock market with specific buy/sell recommendations.\\n\\n\"\n        \"*Commands:*\\n\"\n        \"• /analyze <symbol> - Get detailed analysis for a specific stock\\n\"\n        \"• /scan - Scan all stocks for trading opportunities\\n\"\n        \"• /watchlist - View analysis of your watchlist\\n\"\n        \"• /today - Get today's market overview\\n\\n\"\n        \"You can also just type a stock symbol to get a quick analysis.\\n\\n\"\n        \"Auto-scan is active during market hours and will alert you about high-scoring opportunities.\"\n    )\n    \n    await update.message.reply_text(welcome_message, parse_mode='Markdown')\n\n# Command: /today - Market overview\nasync def market_today(update: Update, context: ContextTypes.DEFAULT_TYPE):\n    if update.effective_user.id != AUTHORIZED_USER_ID:\n        await update.message.reply_text(\"You are not authorized to use this bot.\")\n        return\n    \n    await update.message.reply_text(\"📊 Fetching today's market overview...\")\n    \n    # Get market index data\n    try:\n        indices = [\"^NSEI\", \"^BSESN\"]  # Nifty 50 and Sensex\n        index_data = {}\n        \n        for index in indices:\n            data = yf.download(index, period=\"2d\", interval=\"1d\")\n            if data is not None and not data.empty and len(data) >= 2:\n                latest = data.iloc[-1]\n                prev = data.iloc[-2]\n                change = ((latest['Close'] - prev['Close']) / prev['Close']) * 100\n                index_data[index] = {\n                    'close': latest['Close'],\n                    'change': change,\n                    'volume': latest['Volume']\n                }\n        \n        # Get sector performance (sample sectors)\n        sectors = {\n            \"NIFTY BANK\": \"^NSEBANK\",\n            \"NIFTY IT\": \"NIFTYIT.NS\",\n            \"NIFTY PHARMA\": \"NIFTYPHARMA.NS\",\n            \"NIFTY AUTO\": \"NIFTYAUTO.NS\",\n            \"NIFTY METAL\": \"NIFTYMETAL.NS\"\n        }\n        \n        sector_data = {}\n        for name, symbol in sectors.items():\n            try:\n                data = yf.download(symbol, period=\"2d\", interval=\"1d\")\n                if data is not None and not data.empty and len(data) >= 2:\n                    latest = data.iloc[-1]\n                    prev = data.iloc[-2]\n                    change = ((latest['Close'] - prev['Close']) / prev['Close']) * 100\n                    sector_data[name] = {\n                        'close': latest['Close'],\n                        'change': change\n                    }\n            except Exception as e:\n                logger.error(f\"Error fetching {name} data: {e}\")\n        \n        # Build the message\n        message = \"📈 *TODAY'S MARKET OVERVIEW*\\n\\n\"\n        \n        # Market indices\n        message += \"*Major Indices:*\\n\"\n        if \"^NSEI\" in index_data:\n            nifty = index_data[\"^NSEI\"]\n            emoji = \"🟢\" if nifty['change'] > 0 else \"🔴\"\n            message += f\"{emoji} *Nifty 50:* {nifty['close']:.2f} ({nifty['change']:+.2f}%)\\n\"\n        \n        if \"^BSESN\" in index_data:\n            sensex = index_data[\"^BSESN\"]\n            emoji = \"🟢\" if sensex['change'] > 0 else \"🔴\"\n            message += f\"{emoji} *Sensex:* {sensex['close']:.2f} ({sensex['change']:+.2f}%)\\n\"\n        \n        message += \"\\n*Sector Performance:*\\n\"\n        for name, data in sector_data.items():\n            emoji = \"🟢\" if data['change'] > 0 else \"🔴\"\n            message += f\"{emoji} *{name}:* {data['change']:+.2f}%\\n\"\n        \n        # Get top gainers and losers\n        all_stocks = []\n        for symbol in SYMBOLS[:30]:  # Analyze a subset for performance\n            try:\n                data = yf.download(symbol, period=\"2d\", interval=\"1d\")\n                if data is not None and not data.empty and len(data) >= 2:\n                    latest = data.iloc[-1]\n                    prev = data.iloc[-2]\n                    change = ((latest['Close'] - prev['Close']) / prev['Close']) * 100\n                    all_stocks.append({\n                        'symbol': symbol,\n                        'close': latest['Close'],\n                        'change': change\n                    })\n            except Exception:\n                pass\n        \n        # Sort for top gainers and losers\n        gainers = sorted(all_stocks, key=lambda x: x['change'], reverse=True)[:5]\n        losers = sorted(all_stocks, key=lambda x: x['change'])[:5]\n        \n        message += \"\\n*Top Gainers:*\\n\"\n        for stock in gainers:\n            message += f\"🟢 *{stock['symbol']}:* {stock['change']:+.2f}%\\n\"\n        \n        message += \"\\n*Top Losers:*\\n\"\n        for stock in losers:\n            message += f\"🔴 *{stock['symbol']}:* {stock['change']:+.2f}%\\n\"\n        \n        # Market insight based on overall performance\n        message += \"\\n*Market Insight:*\\n\"\n        if \"^NSEI\" in index_data:\n            nifty_change = index_data[\"^NSEI\"]['change']\n            if nifty_change > 1.5:\n                message += \"• Strong bullish momentum in the market\\n\"\n            elif nifty_change > 0.5:\n                message += \"• Market showing positive bias\\n\"\n            elif nifty_change < -1.5:\n                message += \"• Significant selling pressure in the market\\n\"\n            elif nifty_change < -0.5:\n                message += \"• Market showing negative bias\\n\"\n            else:\n                message += \"• Market trading in a range with no clear direction\\n\"\n        \n        # Add sector rotation insight\n        if sector_data:\n            best_sector = max(sector_data.items(), key=lambda x: x[1]['change'])\n            worst_sector = min(sector_data.items(), key=lambda x: x[1]['change'])\n            message += f\"• Rotation towards {best_sector[0]} ({best_sector[1]['change']:+.2f}%)\\n\"\n            message += f\"• Weakness in {worst_sector[0]} ({worst_sector[1]['change']:+.2f}%)\\n\"\n        \n        await update.message.reply_text(message, parse_mode='Markdown')\n    \n    except Exception as e:\n        logger.error(f\"Error in market_today: {e}\")\n        await update.message.reply_text(f\"❌ Error getting market overview: {str(e)}\")\n\n# Handle normal messages (manual symbol lookup)\ndef is_symbol(text: str) -> bool:\n    text = text.strip()\n    return text.isalpha() and 2 <= len(text) <= 10\n\nasync def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):\n    if update.effective_user.id != AUTHORIZED_USER_ID:\n        await update.message.reply_text(\"You are not authorized to use this bot.\")\n        return\n\n    text = update.message.text.strip().upper()\n    if not is_symbol(text):\n        await update.message.reply_text(\"Unknown command or invalid symbol.\\nUse /analyze <symbol> or just type a stock name.\")\n        return\n\n    symbol = text\n    if \".NS\" not in symbol:\n        symbol += \".NS\"\n\n    await update.message.reply_text(f\"🔍 Analyzing {symbol}...\")\n    analysis = get_analysis(symbol)\n    message = format_analysis_message(analysis)\n    await update.message.reply_text(message, parse_mode='Markdown')\n\n# Auto scanner loop - runs during market hours\nasync def auto_scan(app):\n    logger.info(\"🔁 Running auto-scan for high-potential stocks...\")\n    \n    high_potential_stocks = []\n    \n    for symbol in SYMBOLS:\n        try:\n            analysis = get_analysis(symbol)\n            \n            # Only alert on strong signals\n            if analysis['score'] >= 80 and analysis['action'] in ['STRONG_BUY', 'BUY']:\n                high_potential_stocks.append(analysis)\n            \n            # Limit to prevent rate limiting\n            if len(high_potential_stocks) >= 5:\n                break\n                \n        except Exception as e:\n            logger.error(f\"Error in auto_scan for {symbol}: {e}\")\n    \n    # Send alerts if we found high potential stocks\n    if high_potential_stocks:\n        alert_message = \"🚨 *HIGH POTENTIAL STOCKS DETECTED:*\\n\\n\"\n        \n        for stock in high_potential_stocks:\n            alert_message += f\"🔥 *{stock['symbol']}* - Score: {stock['score']}/100\\n\"\n            alert_message += f\"Action: {stock['action']}\\n\"\n            alert_message += f\"Price: ₹{stock.get('current_price', 'N/A')} | Entry: ₹{stock.get('entry', 'N/A')}\\n\"\n            alert_message += f\"Target: ₹{stock.get('target', 'N/A')} | Stop: ₹{stock.get('stop_loss', 'N/A')}\\n\"\n            alert_message += f\"Time Frame: {stock.get('time_frame', 'N/A')} | R:R: {stock.get('risk_reward', 'N/A')}:1\\n\"\n            \n            if stock.get('technical_summary'):\n                alert_message += \"Key signals: \" + \", \".join(stock['technical_summary'][:2]) + \"\\n\"\n                \n            alert_message += \"\\n\"\n        \n        await app.bot.send_message(\n            chat_id=AUTHORIZED_USER_ID,\n            text=alert_message,\n            parse_mode='Markdown'\n        )\n        \n        logger.info(f\"Sent alerts for {len(high_potential_stocks)} high potential stocks\")\n    else:\n        logger.info(\"Auto-scan complete. No high-potential stocks found.\")\n\n# Main entry point\nasync def main():\n    try:\n        application = Application.builder().token(BOT_TOKEN).build()\n        \n        # Register command handlers\n        application.add_handler(CommandHandler(\"start\", start))\n        application.add_handler(CommandHandler(\"analyze\", analyze_stock))\n        application.add_handler(CommandHandler(\"scan\", scan_stocks))\n        application.add_handler(CommandHandler(\"watchlist\", show_watchlist))\n        application.add_handler(CommandHandler(\"today\", market_today))\n        \n        # Register message and callback handlers\n        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))\n        application.add_handler(CallbackQueryHandler(button_callback))\n\n        await application.initialize()\n\n        # Set up scheduler for auto-scanning\n        scheduler = AsyncIOScheduler()\n        \n        # Auto-scan every hour during market hours\n        scheduler.add_job(\n            lambda: asyncio.create_task(auto_scan(application)), \n            'cron',\n            day_of_week='mon-fri', \n            hour='9-15', \n            minute='30', \n            timezone='Asia/Kolkata'\n        )\n        \n        scheduler.start()\n\n        print(\"✅ StockSniperBot Pro started successfully!\")\n        logger.info(\"Bot and Scheduler started successfully\")\n        \n        # Send startup notification to authorized user\n        await application.bot.send_message(\n            chat_id=AUTHORIZED_USER_ID, \n            text=\"✅ *StockSniperBot Pro* is now online!\\n\\n\"\n                 \"Use the following commands:\\n\"\n                 \"• /analyze <symbol> - Get detailed analysis\\n\"\n                 \"• /scan - Scan all stocks for opportunities\\n\"\n                 \"• /watchlist - View your watchlist\\n\"\n                 \"• /today - Get market overview\",\n            parse_mode='Markdown'\n        )\n        \n        await application.run_polling()\n    except Exception as e:\n        logger.error(f\"Fatal error in main: {e}\")\n        print(f\"❌ Fatal error: {e}\")\n\nif __name__ == \"__main__\":\n    import nest_asyncio\n    nest_asyncio.apply()\n    asyncio.get_event_loop().run_until_complete(main())"
+      },
+      "id": "f632b8af-f2c7-4a3c-8025-d6e482b6ee17",
+      "name": "Main Bot Logic - PASTE bot.py HERE",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -220,
+        620
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.chat_id }}",
+        "text": "={{ $json.message }}",
+        "additionalFields": {
+          "parse_mode": "={{ $json.parse_mode || 'Markdown' }}"
+        }
+      },
+      "id": "4910a29b-fb5d-4abc-840e-4a9fff6db48c",
+      "name": "Send Telegram Response",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        620
+      ],
+      "webhookId": "9d488bd2-55b6-447c-81e1-d314092a4b95",
+      "credentials": {
+        "telegramApi": {
+          "id": "BJJcrb5e0jUwE1aJ",
+          "name": "Telegram account Stock Market"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "updates": [
+          "message"
+        ],
+        "additionalFields": {}
+      },
+      "id": "8ca6bf13-5539-4891-8044-d3817c9afbc0",
+      "name": "Telegram Trigger1",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -660,
+        420
+      ],
+      "webhookId": "telegram-bot-webhook",
+      "credentials": {
+        "telegramApi": {
+          "id": "BJJcrb5e0jUwE1aJ",
+          "name": "Telegram account Stock Market"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "condition1",
+              "leftValue": "={{ $json.message.from.id }}",
+              "rightValue": 945542175,
+              "operator": {
+                "type": "number",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c3c9b6f0-743f-499e-89db-8270fd77ffed",
+      "name": "Check Authorization1",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -440,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.message.chat.id }}",
+        "text": "🚫 You are not authorized to use this bot.",
+        "additionalFields": {
+          "parse_mode": "Markdown"
+        }
+      },
+      "id": "b6bf53de-6529-441a-a46e-e23ec055175e",
+      "name": "Unauthorized Message1",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.1,
+      "position": [
+        -220,
+        220
+      ],
+      "webhookId": "2173d7a3-2950-4fd0-940d-4944a12d8fe9",
+      "credentials": {
+        "telegramApi": {
+          "id": "BJJcrb5e0jUwE1aJ",
+          "name": "Telegram account Stock Market"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.message.text }}",
+                    "rightValue": "/start",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "start"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "e7fe233e-20f6-417e-9d97-659393bea0c4",
+      "name": "Route Commands1",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [
+        -220,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.message.chat.id }}",
+        "text": "👋 *Welcome to StockSniperBot Pro!*\n\nThis bot helps you identify trading opportunities in the Indian stock market with specific buy/sell recommendations.\n\n*Commands:*\n• /analyze <symbol> - Get detailed analysis for a specific stock\n• /scan - Scan all stocks for trading opportunities\n• /watchlist - View analysis of your watchlist\n• /today - Get today's market overview\n\nYou can also just type a stock symbol to get a quick analysis.\n\nAuto-scan is active during market hours and will alert you about high-scoring opportunities.",
+        "additionalFields": {
+          "parse_mode": "Markdown"
+        }
+      },
+      "id": "2f77b1c1-75a8-4af4-9526-7f7ecaca4490",
+      "name": "Start Command1",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        420
+      ],
+      "webhookId": "637e8211-bf51-4dfa-b4bc-2127bea68675",
+      "credentials": {
+        "telegramApi": {
+          "id": "BJJcrb5e0jUwE1aJ",
+          "name": "Telegram account Stock Market"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "id": "2cf96fe8-cbf8-42f8-8920-15abc196fed8",
+      "name": "Auto-Scan Schedule1",
+      "type": "n8n-nodes-base.cron",
+      "typeVersion": 1,
+      "position": [
+        -440,
+        670
+      ]
+    }
+  ],
+  "connections": {
+    "Main Bot Logic - PASTE bot.py HERE": {
+      "main": [
+        [
+          {
+            "node": "Send Telegram Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram Trigger1": {
+      "main": [
+        [
+          {
+            "node": "Check Authorization1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Authorization1": {
+      "main": [
+        [
+          {
+            "node": "Route Commands1",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Main Bot Logic - PASTE bot.py HERE",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Unauthorized Message1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Commands1": {
+      "main": [
+        [
+          {
+            "node": "Start Command1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Auto-Scan Schedule1": {
+      "main": [
+        [
+          {
+            "node": "Main Bot Logic - PASTE bot.py HERE",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {
+    "Telegram Trigger1": [
+      {
+        "update_id": 287684033,
+        "message": {
+          "message_id": 271,
+          "from": {
+            "id": 945542175,
+            "is_bot": false,
+            "first_name": "Hriday",
+            "last_name": "Shah",
+            "username": "hriday_shahh",
+            "language_code": "en"
+          },
+          "chat": {
+            "id": 945542175,
+            "first_name": "Hriday",
+            "last_name": "Shah",
+            "username": "hriday_shahh",
+            "type": "private"
+          },
+          "date": 1750277204,
+          "text": "/analyze",
+          "entities": [
+            {
+              "offset": 0,
+              "length": 8,
+              "type": "bot_command"
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "9cf9354e1647b761bc54296b93c818948c090481ccd08587eb2b953cb6f25d6f"
+  }
+}
